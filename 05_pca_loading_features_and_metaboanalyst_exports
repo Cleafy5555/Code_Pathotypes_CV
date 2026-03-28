@@ -1,0 +1,162 @@
+# ============================================================
+# 05_pca_loading_features_and_metaboanalyst_exports.R
+#
+# Purpose:
+# Summarise PCA feature loadings, plot representative PCA-driving metabolite
+# features across isolate batches, and generate ranked feature lists for
+# MetaboAnalyst/mummichog pathway analysis.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(scales)
+  library(stringr)
+  library(rlang)
+})
+
+qc_dir  <- file.path("outputs", "metabolomics_qc")
+fig_dir <- file.path("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+X_scaled <- readr::read_csv(file.path(qc_dir, "metabolomics_matrix_log2_pareto.csv"), show_col_types = FALSE) %>%
+  tibble::column_to_rownames("alignment_id") %>%
+  as.matrix()
+pca <- stats::prcomp(t(X_scaled), center = TRUE, scale. = FALSE)
+
+feature_meta <- readr::read_csv(file.path(qc_dir, "metabolomics_feature_metadata.csv"), show_col_types = FALSE)
+X_long_loess <- readr::read_csv(file.path(qc_dir, "metabolomics_long_post_loess.csv"), show_col_types = FALSE)
+pca_scores   <- readr::read_csv(file.path(fig_dir, "pca_scores.csv"), show_col_types = FALSE)
+
+pb_palette <- c(
+  "Control"     = "grey35",
+  "Pb-I01 (B1)" = "#B892FF",
+  "Pb-I02 (B1)" = "#88CCEE",
+  "Pb-I02 (B2)" = "#1E555C",
+  "Pb-I03 (B1)" = "#F4D8CD",
+  "Pb-I04 (B1)" = "#B3EFB2",
+  "Pb-I05 (B1)" = "#DDCC77",
+  "Pb-I06 (B1)" = "#CC6677",
+  "Pb-I07 (B1)" = "#688E26",
+  "Pb-I07 (B2)" = "#AA4499",
+  "Pb-I07 (B3)" = "#550527"
+)
+
+feature_meta_std <- feature_meta %>%
+  mutate(alignment_id = as.character(alignment_id)) %>%
+  transmute(
+    alignment_id,
+    mz     = suppressWarnings(as.numeric(mz)),
+    rt_min = suppressWarnings(as.numeric(rt_min)),
+    metabolite = if ("metabolite" %in% names(feature_meta)) metabolite else NA_character_,
+    adduct     = if ("adduct" %in% names(feature_meta)) adduct else NA_character_,
+    sn_avg     = if ("sn_avg" %in% names(feature_meta)) sn_avg else NA_real_
+  ) %>%
+  distinct(alignment_id, .keep_all = TRUE)
+
+feat_loadings <- as.data.frame(pca$rotation) %>%
+  rownames_to_column("alignment_id") %>%
+  as_tibble() %>%
+  mutate(alignment_id = as.character(alignment_id)) %>%
+  select(any_of(c("alignment_id", "PC1", "PC2"))) %>%
+  mutate(PC1_abs = abs(PC1), PC2_abs = abs(PC2), score_PC1PC2 = sqrt(PC1^2 + PC2^2)) %>%
+  left_join(feature_meta_std, by = "alignment_id")
+
+write_csv(feat_loadings, file.path(fig_dir, "SuppTable_PC_Loadings_AllFeatures.csv"))
+write_csv(feat_loadings %>% arrange(desc(PC1_abs)) %>% slice_head(n = 50), file.path(fig_dir, "SuppTable_PC1_Top50_Features_mzRT.csv"))
+
+rep_feats <- feat_loadings %>%
+  filter(is.finite(PC1), !is.na(mz), !is.na(rt_min)) %>%
+  arrange(desc(PC1)) %>%
+  slice_head(n = 4) %>%
+  bind_rows(
+    feat_loadings %>% filter(is.finite(PC1), !is.na(mz), !is.na(rt_min)) %>% arrange(PC1) %>% slice_head(n = 4)
+  ) %>%
+  distinct(alignment_id, .keep_all = TRUE) %>%
+  mutate(feature_label = sprintf("ID %s | m/z %.4f | RT %.2f | PC1 %.3f", alignment_id, mz, rt_min, PC1))
+
+rep_df <- X_long_loess %>%
+  mutate(alignment_id = as.character(alignment_id)) %>%
+  filter(sample_type == "Sample", alignment_id %in% rep_feats$alignment_id) %>%
+  left_join(pca_scores %>% select(sample_id, isolate_id, batch), by = "sample_id") %>%
+  mutate(
+    isolate_batch = if_else(isolate_id == "Control", "Control", paste0(isolate_id, " (", batch, ")")),
+    isolate_batch = factor(isolate_batch, levels = names(pb_palette))
+  ) %>%
+  left_join(rep_feats %>% select(alignment_id, feature_label), by = "alignment_id")
+
+p_rep <- ggplot(rep_df, aes(x = isolate_batch, y = area_loess)) +
+  geom_boxplot(aes(fill = isolate_batch), outlier.shape = NA, width = 0.60, alpha = 0.85, colour = "black", linewidth = 0.35) +
+  geom_jitter(aes(colour = isolate_batch), width = 0.12, size = 1.7, alpha = 0.85) +
+  scale_fill_manual(values = pb_palette, guide = "none", drop = FALSE) +
+  scale_colour_manual(values = pb_palette, guide = "none", drop = FALSE) +
+  scale_y_continuous(trans = scales::trans_new("log10p1", function(x) log10(x + 1), function(x) 10^x - 1), labels = scales::label_number()) +
+  facet_wrap(~ feature_label, scales = "free_y", ncol = 2) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Representative PCA-driving features across isolate batches", x = NULL, y = "LOESS-corrected intensity (log10(x+1))")
+
+ggsave(file.path(fig_dir, "SuppFig_PC1_Representative_Features_Boxplots.png"), p_rep, width = 18, height = 38, units = "cm", dpi = 300)
+
+make_metaboanalyst_topN_from_long <- function(x_long, sample_meta, group_col, group_a, group_b = NULL, out_csv, top_n = 500, test = c("ttest", "wilcox"), value_col = "area_loess") {
+  test <- match.arg(test)
+  dat <- x_long %>%
+    left_join(sample_meta %>% select(sample_id, !!rlang::sym(group_col)), by = "sample_id") %>%
+    rename(.group_raw = !!rlang::sym(group_col)) %>%
+    filter(!is.na(.group_raw), !is.na(.data[[value_col]]), is.finite(.data[[value_col]])) %>%
+    mutate(.group_raw = as.character(.group_raw))
+
+  if (is.null(group_b)) {
+    dat <- dat %>% mutate(.group = ifelse(.group_raw == group_a, group_a, "Other")) %>% filter(.group %in% c(group_a, "Other")) %>% mutate(.group = factor(.group, levels = c(group_a, "Other")))
+  } else {
+    dat <- dat %>% filter(.group_raw %in% c(group_a, group_b)) %>% mutate(.group = factor(.group_raw, levels = c(group_a, group_b)))
+  }
+
+  stats_tbl <- dat %>%
+    group_by(alignment_id, mz) %>%
+    summarise(
+      t.score = {
+        y <- .data[[value_col]]; g <- .group
+        if (test == "ttest") {
+          tt <- try(stats::t.test(y ~ g), silent = TRUE)
+          if (inherits(tt, "try-error")) NA_real_ else unname(tt$statistic)
+        } else NA_real_
+      },
+      p.value = {
+        y <- .data[[value_col]]; g <- .group
+        if (test == "ttest") {
+          tt <- try(stats::t.test(y ~ g), silent = TRUE)
+          if (inherits(tt, "try-error")) NA_real_ else tt$p.value
+        } else {
+          wt <- try(stats::wilcox.test(y ~ g, exact = FALSE), silent = TRUE)
+          if (inherits(wt, "try-error")) NA_real_ else wt$p.value
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(p.value)) %>%
+    arrange(p.value)
+
+  out <- stats_tbl %>% slice_head(n = top_n) %>% transmute(m.z = mz, p.value = p.value, t.score = t.score)
+  readr::write_csv(out, out_csv)
+  out
+}
+
+sample_meta_export <- pca_scores %>%
+  transmute(sample_id, treatment_pretty = if_else(isolate_id == "Control", "Control", "Inoculated")) %>%
+  distinct()
+
+make_metaboanalyst_topN_from_long(
+  x_long = X_long_loess,
+  sample_meta = sample_meta_export,
+  group_col = "treatment_pretty",
+  group_a = "Control",
+  group_b = NULL,
+  out_csv = file.path(fig_dir, "MetaboAnalyst_Top500_Control_vs_AllIsolates.csv"),
+  top_n = 500,
+  test = "ttest",
+  value_col = "area_loess"
+)
