@@ -1,0 +1,183 @@
+# ============================================================
+# 03_metabolomics_preprocessing_qc.R
+#
+# Purpose:
+# Import aligned MS-DIAL positive-mode feature exports for the Chapter 5
+# pathotype metabolomics experiment, reconstruct sample metadata, apply blank
+# filtering, QC-RSD filtering, QC-LOESS correction, and prepare the final
+# intensity matrix for multivariate analysis.
+#
+# Main outputs:
+# - metabolomics_sample_metadata.csv
+# - metabolomics_feature_metadata.csv
+# - metabolomics_long_pre_loess.csv
+# - metabolomics_long_post_loess.csv
+# - metabolomics_matrix_log2_pareto.csv
+# - qc_rsd_pre_post.csv
+# - feature_retention_summary.csv
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(janitor)
+  library(stringr)
+  library(ggplot2)
+  library(scales)
+})
+
+base_dir <- file.path("data", "raw", "metabolomics")
+fig_dir  <- file.path("outputs", "metabolomics_qc")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+area_file <- file.path(base_dir, "Area_0_2026251744.txt")
+meta_file <- file.path(base_dir, "injection_order_from_headers.csv")
+
+sample_meta_raw <- readr::read_csv(meta_file, show_col_types = FALSE) %>% janitor::clean_names()
+stopifnot(all(c("acquired_name", "injection_order") %in% names(sample_meta_raw)))
+
+sample_meta_raw <- sample_meta_raw %>%
+  mutate(
+    acquired_name   = as.character(acquired_name),
+    injection_order = as.integer(injection_order),
+    sample_type = case_when(
+      str_detect(acquired_name, regex("QC", ignore_case = TRUE)) ~ "QC",
+      str_detect(acquired_name, regex("Blank|ACN", ignore_case = TRUE)) ~ "Blank",
+      TRUE ~ "Sample"
+    ),
+    sample_type = factor(sample_type, levels = c("Blank", "QC", "Sample"))
+  )
+
+hdr <- readLines(area_file, n = 1)
+hdr_clean <- stringr::str_remove(hdr, "\\t1\\t1\\s*$")
+
+area <- readr::read_tsv(
+  file = area_file,
+  col_names = stringr::str_split(hdr_clean, "\\t", simplify = TRUE),
+  skip = 1,
+  na = c("NA", "null", ""),
+  show_col_types = FALSE,
+  progress = FALSE
+)
+
+area_sample_cols <- names(area)[stringr::str_detect(names(area), "^\\d+_")]
+if (length(area_sample_cols) == 0) stop("No sample columns detected in the Area file.")
+
+area_key <- tibble(sample_id = area_sample_cols, acquired_name = stringr::str_replace(sample_id, "^\\d+_", ""))
+sample_meta <- area_key %>%
+  left_join(sample_meta_raw %>% select(acquired_name, injection_order, sample_type), by = "acquired_name") %>%
+  rename(inj_order = injection_order)
+
+write_csv(sample_meta, file.path(fig_dir, "metabolomics_sample_metadata.csv"))
+
+feature_meta <- area %>%
+  transmute(
+    alignment_id = .data[["Alignment ID"]],
+    rt_min       = .data[["Average Rt(min)"]],
+    mz           = .data[["Average Mz"]],
+    metabolite   = .data[["Metabolite name"]],
+    adduct       = .data[["Adduct type"]],
+    sn_avg       = .data[["S/N average"]]
+  )
+write_csv(feature_meta, file.path(fig_dir, "metabolomics_feature_metadata.csv"))
+
+X <- area %>%
+  select(all_of(area_sample_cols)) %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
+  as.matrix()
+rownames(X) <- area[["Alignment ID"]]
+
+X_long <- tibble::as_tibble(X, rownames = "alignment_id") %>%
+  mutate(alignment_id = as.character(alignment_id)) %>%
+  pivot_longer(cols = -alignment_id, names_to = "sample_id", values_to = "area") %>%
+  left_join(sample_meta, by = "sample_id") %>%
+  left_join(feature_meta %>% mutate(alignment_id = as.character(alignment_id)), by = "alignment_id") %>%
+  mutate(
+    alignment_id = as.character(alignment_id),
+    sample_id    = as.character(sample_id),
+    area         = as.numeric(area),
+    inj_order    = as.numeric(inj_order),
+    sample_type  = as.character(sample_type)
+  )
+write_csv(X_long, file.path(fig_dir, "metabolomics_long_pre_loess.csv"))
+
+blank_ratio_cutoff <- 1.3
+qc_rsd_cutoff      <- 70
+loess_span         <- 0.75
+min_qc_per_feature <- 6
+
+blank_stats <- X_long %>%
+  group_by(alignment_id, sample_type) %>%
+  summarise(mean_area = mean(area, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = sample_type, values_from = mean_area)
+keep_blank <- blank_stats %>% filter(is.na(Blank) | Blank < blank_ratio_cutoff * Sample) %>% pull(alignment_id)
+X_long_bf <- X_long %>% filter(alignment_id %in% keep_blank)
+
+qc_rsd <- X_long_bf %>%
+  filter(sample_type == "QC") %>%
+  group_by(alignment_id) %>%
+  summarise(
+    qc_mean = mean(area, na.rm = TRUE),
+    qc_sd   = sd(area, na.rm = TRUE),
+    qc_rsd  = qc_sd / qc_mean * 100,
+    n_qc    = sum(!is.na(area)),
+    .groups = "drop"
+  )
+keep_qc <- qc_rsd %>% filter(is.finite(qc_rsd), qc_rsd <= qc_rsd_cutoff) %>% pull(alignment_id)
+X_long_qc <- X_long_bf %>% filter(alignment_id %in% keep_qc)
+
+qc_loess_correct <- function(df, span = loess_span, min_qc = min_qc_per_feature) {
+  qc <- df %>% filter(sample_type == "QC")
+  if (nrow(qc) < min_qc) return(df$area)
+  fit <- try(stats::loess(area ~ inj_order, data = qc, span = span, degree = 1), silent = TRUE)
+  if (inherits(fit, "try-error")) return(df$area)
+  pred <- predict(fit, newdata = df)
+  qc_med <- median(qc$area, na.rm = TRUE)
+  df$area / pred * qc_med
+}
+
+X_long_loess <- X_long_qc %>%
+  group_by(alignment_id) %>%
+  mutate(area_loess = qc_loess_correct(pick(everything()))) %>%
+  ungroup() %>%
+  mutate(area_loess = if_else(!is.na(area_loess) & area_loess < 0, 0, area_loess))
+write_csv(X_long_loess, file.path(fig_dir, "metabolomics_long_post_loess.csv"))
+
+X_wide_loess <- X_long_loess %>% select(alignment_id, sample_id, area_loess) %>% pivot_wider(names_from = sample_id, values_from = area_loess)
+X_mat_final <- X_wide_loess %>% tibble::column_to_rownames("alignment_id") %>% as.matrix()
+X_mat_final[X_mat_final < 0] <- 0
+X_mat_final <- X_mat_final[rowSums(is.finite(X_mat_final)) == ncol(X_mat_final), , drop = FALSE]
+X_log <- log2(X_mat_final + 1)
+pareto_scale <- function(x) {
+  s <- stats::sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  x / sqrt(s)
+}
+X_scaled <- apply(X_log, 2, pareto_scale)
+write_csv(as.data.frame(X_scaled) %>% tibble::rownames_to_column("alignment_id"), file.path(fig_dir, "metabolomics_matrix_log2_pareto.csv"))
+
+rsd_pct <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  s <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(m) || m == 0) return(NA_real_)
+  (s / abs(m)) * 100
+}
+
+qc_rsd_pre <- X_long_qc %>% filter(sample_type == "QC") %>% group_by(alignment_id) %>% summarise(qc_rsd_pre = rsd_pct(area), .groups = "drop")
+qc_rsd_post <- X_long_loess %>% filter(sample_type == "QC") %>% group_by(alignment_id) %>% summarise(qc_rsd_post = rsd_pct(area_loess), .groups = "drop")
+qc_rsd_both <- qc_rsd_pre %>% inner_join(qc_rsd_post, by = "alignment_id") %>% filter(is.finite(qc_rsd_pre), is.finite(qc_rsd_post))
+write_csv(qc_rsd_both, file.path(fig_dir, "qc_rsd_pre_post.csv"))
+
+qc_long <- qc_rsd_both %>% pivot_longer(cols = c(qc_rsd_pre, qc_rsd_post), names_to = "stage", values_to = "qc_rsd")
+p_rsd <- ggplot(qc_long, aes(x = stage, y = qc_rsd, fill = stage)) +
+  geom_violin(trim = FALSE, alpha = 0.5, colour = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA) +
+  theme_classic(base_size = 12) +
+  labs(x = NULL, y = "QC RSD (%)", title = "QC RSD before and after LOESS correction")
+ggsave(file.path(fig_dir, "SuppFig_S5_QC_RSD_Pre_vs_Post_LOESS.png"), p_rsd, width = 14, height = 10, units = "cm", dpi = 300)
+
+retention_tbl <- tibble::tibble(
+  step = c("start", "blank_filter", "qc_rsd_filter", "loess_final"),
+  n_features = c(n_distinct(X_long$alignment_id), n_distinct(X_long_bf$alignment_id), n_distinct(X_long_qc$alignment_id), n_distinct(X_long_loess$alignment_id))
+)
+write_csv(retention_tbl, file.path(fig_dir, "feature_retention_summary.csv"))
