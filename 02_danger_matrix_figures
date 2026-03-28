@@ -1,0 +1,270 @@
+# ============================================================
+# 02_danger_matrix_figures.R
+#
+# Purpose:
+# Generate the main and supplementary phenotype figures for the Chapter 5
+# pathotype trial, using the plant-level table and severity–danger outputs
+# produced by 01_danger_matrix_core.R.
+#
+# Main inputs:
+# - outputs/danger_matrix/per_plant_merged.csv
+# - outputs/danger_matrix/danger_matrix_table_for_modelling.csv
+#
+# Main outputs:
+# - fig_main_yield_instability.png
+# - fig_danger_matrix.png
+# - supp_fig_dsi_boxplot.png
+# - supp_fig_cv_yield_bunchweight.png
+# - supp_fig_height_biomass.png
+# - supp_fig_dsi_vs_performance.png
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(readr)
+  library(tidyr)
+})
+
+in_dir  <- file.path("outputs", "danger_matrix")
+fig_dir <- file.path("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+plant <- readr::read_csv(file.path(in_dir, "per_plant_merged.csv"), show_col_types = FALSE)
+mat_plot <- readr::read_csv(file.path(in_dir, "danger_matrix_table_for_modelling.csv"), show_col_types = FALSE)
+
+pb_palette <- c(
+  "Control"     = "grey35",
+  "Pb-I01 (B1)" = "#B892FF",
+  "Pb-I02 (B1)" = "#88CCEE",
+  "Pb-I02 (B2)" = "#1E555C",
+  "Pb-I03 (B1)" = "#F4D8CD",
+  "Pb-I04 (B1)" = "#B3EFB2",
+  "Pb-I05 (B1)" = "#DDCC77",
+  "Pb-I06 (B1)" = "#CC6677",
+  "Pb-I07 (B1)" = "#688E26",
+  "Pb-I07 (B2)" = "#AA4499",
+  "Pb-I07 (B3)" = "#550527"
+)
+
+id_map <- c(
+  "Amishield"    = "Pb-I01",
+  "Delmore"      = "Pb-I02",
+  "Goodmans"     = "Pb-I03",
+  "Marsden soil" = "Pb-I04",
+  "Marsfield"    = "Pb-I05",
+  "Mixed"        = "Pb-I06",
+  "Yes Bio"      = "Pb-I07"
+)
+
+batch_key <- plant %>%
+  filter(as.character(TreatmentDate) != "Control") %>%
+  transmute(
+    TreatmentDate = as.character(TreatmentDate),
+    isolate_raw = stringr::str_replace(TreatmentDate, "_\\d{4}-\\d{2}-\\d{2}$", ""),
+    batch_date  = stringr::str_extract(TreatmentDate, "\\d{4}-\\d{2}-\\d{2}$"),
+    isolate_id  = dplyr::case_when(
+      isolate_raw %in% names(id_map) ~ unname(id_map[isolate_raw]),
+      TRUE ~ isolate_raw
+    )
+  ) %>%
+  distinct(isolate_id, batch_date) %>%
+  arrange(isolate_id, batch_date) %>%
+  group_by(isolate_id) %>%
+  mutate(batch_lab = paste0("B", row_number())) %>%
+  ungroup()
+
+plant_plot <- plant %>%
+  mutate(TreatmentDate = as.character(TreatmentDate)) %>%
+  transmute(
+    sample_number,
+    TreatmentDate,
+    total_yield_g,
+    mean_bunch_g,
+    max_height_cm,
+    Height_any,
+    total_dry_g,
+    DSI,
+    isolate_raw = if_else(TreatmentDate == "Control", "Control", stringr::str_replace(TreatmentDate, "_\\d{4}-\\d{2}-\\d{2}$", "")),
+    batch_date  = if_else(TreatmentDate == "Control", NA_character_, stringr::str_extract(TreatmentDate, "\\d{4}-\\d{2}-\\d{2}$")),
+    isolate_id = case_when(
+      isolate_raw == "Control" ~ "Control",
+      isolate_raw %in% names(id_map) ~ unname(id_map[isolate_raw]),
+      TRUE ~ isolate_raw
+    )
+  ) %>%
+  left_join(batch_key, by = c("isolate_id", "batch_date")) %>%
+  mutate(label = case_when(
+    isolate_id == "Control" ~ "Control",
+    TRUE ~ paste0(isolate_id, " (", batch_lab, ")")
+  ))
+
+ctrl_threshold <- plant_plot %>%
+  filter(label == "Control") %>%
+  summarise(threshold = 0.5 * median(total_yield_g, na.rm = TRUE)) %>%
+  pull(threshold)
+
+instability_tbl <- plant_plot %>%
+  group_by(label) %>%
+  summarise(
+    low_yield_prop = mean(total_yield_g < ctrl_threshold, na.rm = TRUE),
+    cv_yield = sd(total_yield_g, na.rm = TRUE) / mean(total_yield_g, na.rm = TRUE),
+    cv_bunch = sd(mean_bunch_g,  na.rm = TRUE) / mean(mean_bunch_g,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_order <- c(
+  "Control",
+  instability_tbl %>%
+    filter(label != "Control") %>%
+    arrange(desc(low_yield_prop)) %>%
+    pull(label)
+)
+
+plant_plot <- plant_plot %>% mutate(label = factor(label, levels = plot_order))
+instability_tbl <- instability_tbl %>% mutate(label = factor(label, levels = plot_order))
+mat_plot <- mat_plot %>% mutate(label = factor(label, levels = plot_order))
+
+# Supplementary DSI boxplot
+p_dsi <- ggplot(plant_plot, aes(x = label, y = DSI, fill = label)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, colour = "black", linewidth = 0.35) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.85) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Disease severity index (0–4)", title = "DSI by isolate batch")
+
+ggsave(file.path(fig_dir, "supp_fig_dsi_boxplot.png"), p_dsi, width = 18, height = 12, units = "cm", dpi = 300)
+
+# Main yield + instability figure
+p_yield <- ggplot(plant_plot, aes(x = label, y = total_yield_g, fill = label)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, colour = "black", linewidth = 0.35) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.85) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Cumulative yield per plant (g)", title = "A. Cumulative yield")
+
+p_low <- ggplot(instability_tbl, aes(x = label, y = low_yield_prop, fill = label)) +
+  geom_col(width = 0.70, colour = "black", linewidth = 0.35) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = NULL,
+    y = "Low-yielding plants",
+    title = "B. Yield instability",
+    subtitle = paste0("Low yield = <50% of control median (", round(ctrl_threshold, 1), " g)")
+  )
+
+p_main1 <- p_yield / p_low + patchwork::plot_layout(heights = c(1, 0.8))
+ggsave(file.path(fig_dir, "fig_main_yield_instability.png"), p_main1, width = 18, height = 22, units = "cm", dpi = 300)
+
+# CV figure
+cv_long <- instability_tbl %>%
+  select(label, cv_yield, cv_bunch) %>%
+  pivot_longer(cols = c(cv_yield, cv_bunch), names_to = "metric", values_to = "cv")
+
+p_cv <- ggplot(cv_long, aes(x = label, y = cv, fill = label)) +
+  geom_col(width = 0.70, colour = "black", linewidth = 0.35) +
+  facet_wrap(~ metric, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Coefficient of variation", title = "Yield-related dispersion metrics")
+
+ggsave(file.path(fig_dir, "supp_fig_cv_yield_bunchweight.png"), p_cv, width = 18, height = 18, units = "cm", dpi = 300)
+
+# Height and biomass figure
+growth_long <- plant_plot %>%
+  transmute(
+    label,
+    `Plant height (cm)` = dplyr::coalesce(max_height_cm, Height_any),
+    `Total dry biomass (g)` = total_dry_g
+  ) %>%
+  pivot_longer(cols = -label, names_to = "trait", values_to = "value")
+
+p_growth <- ggplot(growth_long, aes(x = label, y = value, fill = label)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, colour = "black", linewidth = 0.35) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.85) +
+  facet_wrap(~ trait, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Vegetative growth responses by isolate batch")
+
+ggsave(file.path(fig_dir, "supp_fig_height_biomass.png"), p_growth, width = 18, height = 20, units = "cm", dpi = 300)
+
+# DSI vs performance figure
+s4_df <- plant_plot %>% mutate(height_used = dplyr::coalesce(max_height_cm, Height_any))
+ct_yield <- suppressWarnings(cor.test(s4_df$DSI, s4_df$total_yield_g, method = "spearman", exact = FALSE))
+ct_biom  <- suppressWarnings(cor.test(s4_df$DSI, s4_df$total_dry_g, method = "spearman", exact = FALSE))
+
+p_dsi_y <- ggplot(s4_df, aes(x = DSI, y = total_yield_g, colour = label)) +
+  geom_point(size = 2.4, alpha = 0.9) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.6, colour = "grey30") +
+  scale_colour_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "A. DSI versus cumulative yield",
+    subtitle = sprintf("Spearman rho = %.2f, p = %.3f", unname(ct_yield$estimate), ct_yield$p.value),
+    x = "DSI",
+    y = "Cumulative yield per plant (g)",
+    colour = "Isolate batch"
+  )
+
+p_dsi_b <- ggplot(s4_df, aes(x = DSI, y = total_dry_g, colour = label)) +
+  geom_point(size = 2.4, alpha = 0.9) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.6, colour = "grey30") +
+  scale_colour_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "B. DSI versus total dry biomass",
+    subtitle = sprintf("Spearman rho = %.2f, p = %.3f", unname(ct_biom$estimate), ct_biom$p.value),
+    x = "DSI",
+    y = "Total dry biomass (g)",
+    colour = "Isolate batch"
+  )
+
+p_s4 <- p_dsi_y + p_dsi_b + patchwork::plot_layout(guides = "collect")
+ggsave(file.path(fig_dir, "supp_fig_dsi_vs_performance.png"), p_s4, width = 24, height = 12, units = "cm", dpi = 300)
+
+# Danger matrix
+sev_breaks  <- c(0, 0.15, 0.35, 1.2)
+risk_breaks <- c(0, 0.10, 0.30, 1.0)
+
+tile_df <- tidyr::expand_grid(
+  xmin = risk_breaks[-length(risk_breaks)],
+  xmax = risk_breaks[-1],
+  ymin = sev_breaks[-length(sev_breaks)],
+  ymax = sev_breaks[-1]
+) %>%
+  mutate(fill_group = c(
+    "Low", "Moderate", "High",
+    "Moderate", "Moderate", "High",
+    "High", "High", "High"
+  ))
+
+tile_cols <- c("Low" = "#A5D6A7", "Moderate" = "#FFCC80", "High" = "#EF9A9A")
+
+p_mat <- ggplot() +
+  geom_rect(data = tile_df, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill_group), alpha = 0.35, colour = "white") +
+  geom_vline(xintercept = c(0.10, 0.30), linetype = "dashed") +
+  geom_hline(yintercept = c(0.15, 0.35), linetype = "dashed") +
+  geom_point(data = mat_plot, aes(x = crash_rate_any, y = worstQ_severity, colour = label), size = 3.5) +
+  geom_text(data = mat_plot, aes(x = crash_rate_any, y = worstQ_severity, label = label), vjust = -0.8, size = 3.2, check_overlap = TRUE) +
+  scale_fill_manual(values = tile_cols, guide = "none") +
+  scale_colour_manual(values = pb_palette, guide = "none", drop = FALSE) +
+  scale_x_continuous(labels = scales::label_percent()) +
+  theme_classic(base_size = 12) +
+  labs(
+    x = "Danger (plants with at least one crash event)",
+    y = "Severity (worst quartile composite score)",
+    title = "Severity–danger matrix"
+  )
+
+ggsave(file.path(fig_dir, "fig_danger_matrix.png"), p_mat, width = 20, height = 14, units = "cm", dpi = 300)
