@@ -1,0 +1,130 @@
+# ============================================================
+# 04_metabolomics_pca_and_danger_link.R
+#
+# Purpose:
+# Run PCA on the final metabolomics matrix, reconstruct isolate/batch labels,
+# generate the Chapter 5 PCA plot, and quantify how far each isolate batch
+# diverges from the non-inoculated control centroid in PC1–PC2 space.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(scales)
+})
+
+qc_dir  <- file.path("outputs", "metabolomics_qc")
+risk_dir <- file.path("outputs", "danger_matrix")
+fig_dir <- file.path("outputs", "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+X_scaled <- readr::read_csv(file.path(qc_dir, "metabolomics_matrix_log2_pareto.csv"), show_col_types = FALSE) %>%
+  tibble::column_to_rownames("alignment_id") %>%
+  as.matrix()
+
+sample_meta <- readr::read_csv(file.path(qc_dir, "metabolomics_sample_metadata.csv"), show_col_types = FALSE)
+danger_tbl  <- readr::read_csv(file.path(risk_dir, "danger_matrix_table_for_modelling.csv"), show_col_types = FALSE)
+
+pca <- stats::prcomp(t(X_scaled), center = TRUE, scale. = FALSE)
+var_exp <- summary(pca)$importance[2, ] * 100
+
+pca_scores <- as.data.frame(pca$x) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  left_join(sample_meta, by = "sample_id")
+
+extract_code <- function(x) {
+  x %>%
+    stringr::str_extract("(?<=_Pos_)[A-Za-z0-9_]+") %>%
+    stringr::str_replace("^C_?.*$", "C") %>%
+    stringr::str_remove("\\d+$")
+}
+
+code_map <- tibble::tribble(
+  ~code,  ~treatment_pretty, ~isolate_id, ~batch,
+  "MB",   "Marsfield",       "Pb-I05",    "B1",
+  "DELB", "Delmore",         "Pb-I02",    "B1",
+  "DB",   "Delmore",         "Pb-I02",    "B2",
+  "YBB",  "Yes Bio",         "Pb-I07",    "B2",
+  "XB",   "Mixed",           "Pb-I06",    "B1",
+  "AA",   "Amishield",       "Pb-I01",    "B1",
+  "Y23B", "Yes Bio",         "Pb-I07",    "B1",
+  "MSB",  "Marsden soil",    "Pb-I04",    "B1",
+  "GB",   "Goodmans",        "Pb-I03",    "B1",
+  "Y24A", "Yes Bio",         "Pb-I07",    "B3",
+  "C",    "Control",         "Control",   "B0"
+)
+
+sample_meta2 <- sample_meta %>% mutate(code = extract_code(dplyr::coalesce(acquired_name, sample_id))) %>% left_join(code_map, by = "code")
+pca_scores <- pca_scores %>%
+  select(-any_of(c("code", "treatment_pretty", "isolate_id", "batch"))) %>%
+  left_join(sample_meta2 %>% select(sample_id, code, treatment_pretty, isolate_id, batch), by = "sample_id")
+write_csv(pca_scores, file.path(fig_dir, "pca_scores.csv"))
+
+pb_palette <- c(
+  "Control"     = "grey35",
+  "Pb-I01 (B1)" = "#B892FF",
+  "Pb-I02 (B1)" = "#88CCEE",
+  "Pb-I02 (B2)" = "#1E555C",
+  "Pb-I03 (B1)" = "#F4D8CD",
+  "Pb-I04 (B1)" = "#B3EFB2",
+  "Pb-I05 (B1)" = "#DDCC77",
+  "Pb-I06 (B1)" = "#CC6677",
+  "Pb-I07 (B1)" = "#688E26",
+  "Pb-I07 (B2)" = "#AA4499",
+  "Pb-I07 (B3)" = "#550527"
+)
+
+pca_plot_df <- pca_scores %>%
+  filter(sample_type == "Sample") %>%
+  mutate(
+    isolate_batch = if_else(isolate_id == "Control", "Control", paste0(isolate_id, " (", batch, ")")),
+    isolate_batch = factor(isolate_batch, levels = names(pb_palette))
+  )
+
+p_pca <- ggplot(pca_plot_df, aes(PC1, PC2, colour = isolate_batch)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_colour_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "PCA (LOESS-corrected, log2 + Pareto)",
+    colour = "Isolate (batch)",
+    x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_exp[2], 1), "%)")
+  )
+ggsave(file.path(fig_dir, "Fig4_PCA_LOESS_log2_Pareto.png"), p_pca, width = 18, height = 14, units = "cm", dpi = 600)
+
+ctrl_centroid <- pca_plot_df %>% filter(isolate_batch == "Control") %>% summarise(ctrl_PC1 = mean(PC1, na.rm = TRUE), ctrl_PC2 = mean(PC2, na.rm = TRUE))
+
+dist_df <- pca_plot_df %>% mutate(dist_to_ctrl = sqrt((PC1 - ctrl_centroid$ctrl_PC1)^2 + (PC2 - ctrl_centroid$ctrl_PC2)^2))
+dist_summ <- dist_df %>% group_by(isolate_batch) %>% summarise(n = n(), mean_dist = mean(dist_to_ctrl, na.rm = TRUE), sd_dist = sd(dist_to_ctrl, na.rm = TRUE), se_dist = sd_dist/sqrt(n), .groups = "drop")
+write_csv(dist_summ, file.path(fig_dir, "pca_distance_to_control_summary.csv"))
+
+p_dist <- ggplot(dist_df, aes(x = isolate_batch, y = dist_to_ctrl, fill = isolate_batch)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, colour = "black", linewidth = 0.35) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.85) +
+  scale_fill_manual(values = pb_palette, drop = FALSE) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Distance to control centroid", title = "Metabolomic divergence by isolate batch")
+ggsave(file.path(fig_dir, "Fig5A_PCA_DistanceToControl_byIsolateBatch.png"), p_dist, width = 18, height = 14, units = "cm", dpi = 300)
+
+dist_vs_danger <- dist_summ %>% left_join(danger_tbl %>% transmute(isolate_batch = label, danger = crash_rate_any, severity = worstQ_severity), by = "isolate_batch")
+plot_df <- dist_vs_danger %>% filter(!is.na(danger), isolate_batch != "Control")
+spearman <- suppressWarnings(cor.test(plot_df$danger, plot_df$mean_dist, method = "spearman", exact = FALSE))
+
+p_fig5B <- ggplot(dist_vs_danger, aes(x = danger, y = mean_dist, colour = isolate_batch)) +
+  geom_point(size = 3.6, alpha = 0.95) +
+  geom_errorbar(aes(ymin = mean_dist - se_dist, ymax = mean_dist + se_dist), width = 0, linewidth = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, colour = "grey30", linewidth = 0.6) +
+  scale_colour_manual(values = pb_palette, guide = "none", drop = FALSE) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Metabolomic divergence increases with isolate-associated risk",
+    subtitle = sprintf("Spearman rho = %.2f, p = %.3f", unname(spearman$estimate), spearman$p.value),
+    x = "Danger (crash rate; proportion of plants with ≥1 crash event)",
+    y = "Mean distance to control centroid (PC1–PC2)"
+  )
+ggsave(file.path(fig_dir, "Fig5B_PCA_DistanceToControl_vsDanger.png"), p_fig5B, width = 18, height = 14, units = "cm", dpi = 300)
