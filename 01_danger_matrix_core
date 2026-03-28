@@ -1,0 +1,324 @@
+# ============================================================
+# 01_danger_matrix_core.R
+#
+# Purpose:
+# Build the per-plant phenotyping table for the Chapter 5 pathotype trial,
+# calculate treatment-vs-control contrasts for key agronomic traits, and
+# construct the severity–danger matrix used in the main text.
+#
+# Main inputs:
+# - Pathotypes_Production.xlsx
+# - Height_DW_combined.xlsx
+#
+# Main outputs:
+# - cleaned_production.csv
+# - cleaned_height_dw.csv
+# - per_plant_merged.csv
+# - dunnett_vs_control_traits.csv
+# - danger_matrix_table.csv
+# - danger_matrix_table_with_bands.csv
+# - danger_matrix_table_for_modelling.csv
+#
+# Notes:
+# - This script keeps the original isolate names only long enough to map them
+#   to anonymised isolate IDs (Pb-I01, Pb-I02, etc.).
+# - Severity is a per-plant composite score across yield, dry biomass, height,
+#   and DSI. Higher values indicate worse overall performance.
+# - Danger is the proportion of plants in a treatment that crossed at least one
+#   low-performance threshold.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(janitor)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(lubridate)
+  library(ggplot2)
+  library(emmeans)
+  library(broom)
+  library(car)
+  library(scales)
+})
+
+# ------------------------------------------------------------
+# 0) Paths
+# ------------------------------------------------------------
+prod_file <- file.path("data", "raw", "Pathotypes_Production.xlsx")
+hdw_file  <- file.path("data", "raw", "Height_DW_combined.xlsx")
+out_dir   <- file.path("outputs", "danger_matrix")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Map grower/source names to anonymised isolate IDs used in the thesis figures.
+id_map <- c(
+  "Amishield"    = "Pb-I01",
+  "Delmore"      = "Pb-I02",
+  "Goodmans"     = "Pb-I03",
+  "Marsden soil" = "Pb-I04",
+  "Marsfield"    = "Pb-I05",
+  "Mixed"        = "Pb-I06",
+  "Yes Bio"      = "Pb-I07"
+)
+
+# ------------------------------------------------------------
+# 1) Helper: parse spore collection date robustly
+# ------------------------------------------------------------
+# The working file used multiple date styles (Excel serial, Oct-24, d/m/Y).
+# This helper standardises them to Date so each isolate source can be tracked
+# as a treatment-date batch.
+parse_spore_date <- function(spores_raw, spores_iso = NULL) {
+  if (!is.null(spores_iso)) {
+    x <- suppressWarnings(as.Date(as.character(spores_iso)))
+    if (any(!is.na(x))) return(x)
+  }
+
+  s <- stringr::str_trim(as.character(spores_raw))
+  s <- dplyr::na_if(s, "N/A")
+  s <- dplyr::na_if(s, "NA")
+  s <- dplyr::na_if(s, "")
+  s <- dplyr::na_if(s, "n/a")
+
+  dplyr::case_when(
+    is.na(s) ~ as.Date(NA),
+    stringr::str_detect(s, "^\\d+$") ~ as.Date(as.numeric(s), origin = "1899-12-30"),
+    stringr::str_detect(s, "^[A-Za-z]{3}-\\d{2}$") ~ as.Date(paste0("01-", s), format = "%d-%b-%y"),
+    stringr::str_detect(s, "^\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}$") ~ suppressWarnings(lubridate::dmy(stringr::str_replace_all(s, "-", "/"))),
+    TRUE ~ as.Date(NA)
+  )
+}
+
+# ------------------------------------------------------------
+# 2) Production table: clean and summarise to the plant level
+# ------------------------------------------------------------
+prod_raw <- readxl::read_excel(prod_file) %>% janitor::clean_names()
+
+prod <- prod_raw %>%
+  mutate(
+    sample_number = if ("sample_number" %in% names(.)) as.character(sample_number) else as.character(sample),
+    sample_number = stringr::str_trim(sample_number),
+    treatment = if ("treatment" %in% names(.)) as.character(treatment) else as.character(Treatment),
+    treatment = stringr::str_trim(treatment),
+    spore_date = parse_spore_date(
+      spores_raw = if ("spores_collected" %in% names(.)) spores_collected else Spores_collected,
+      spores_iso = if ("spores_collected_iso" %in% names(.)) spores_collected_iso else NULL
+    ),
+    harvest_date = suppressWarnings(as.Date(date)),
+    bw   = suppressWarnings(as.numeric(bw)),
+    h_cm = if ("height" %in% names(.)) suppressWarnings(as.numeric(height)) else NA_real_
+  ) %>%
+  mutate(
+    DateBatch = if_else(is.na(spore_date), NA_character_, format(spore_date, "%Y-%m-%d")),
+    TreatmentDate = if_else(treatment == "Control", "Control", paste(treatment, DateBatch, sep = "_")),
+    TreatmentDate = stats::relevel(factor(TreatmentDate), ref = "Control")
+  )
+
+write.csv(prod, file.path(out_dir, "cleaned_production.csv"), row.names = FALSE)
+
+# Summarise weekly harvest observations to one row per plant.
+prod_plant <- prod %>%
+  group_by(sample_number, TreatmentDate) %>%
+  summarise(
+    total_yield_g  = sum(bw, na.rm = TRUE),
+    mean_bunch_g   = mean(bw, na.rm = TRUE),
+    n_harvests     = sum(!is.na(bw)),
+    first_harvest  = suppressWarnings(min(harvest_date, na.rm = TRUE)),
+    last_harvest   = suppressWarnings(max(harvest_date, na.rm = TRUE)),
+    harvest_span_d = as.numeric(last_harvest - first_harvest),
+    mean_height_cm = mean(h_cm, na.rm = TRUE),
+    max_height_cm  = suppressWarnings(max(h_cm, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    harvest_span_d = if_else(is.infinite(harvest_span_d), NA_real_, harvest_span_d),
+    first_harvest  = if_else(is.infinite(as.numeric(first_harvest)), as.Date(NA), first_harvest),
+    last_harvest   = if_else(is.infinite(as.numeric(last_harvest)), as.Date(NA), last_harvest)
+  )
+
+# ------------------------------------------------------------
+# 3) Height / dry biomass / DSI table: clean and standardise
+# ------------------------------------------------------------
+hdw_raw <- readxl::read_excel(hdw_file) %>% janitor::clean_names()
+
+hdw <- hdw_raw %>%
+  mutate(
+    sample_number = if ("sample" %in% names(.)) as.character(sample) else as.character(sample_number),
+    sample_number = stringr::str_trim(sample_number),
+    treatment = if ("treatment" %in% names(.)) as.character(treatment) else as.character(Treatment),
+    treatment = stringr::str_trim(treatment),
+    spore_date = parse_spore_date(
+      spores_raw = if ("spores_collected" %in% names(.)) spores_collected else Spores_collected,
+      spores_iso = if ("spores_collected_iso" %in% names(.)) spores_collected_iso else NULL
+    ),
+    Height_any = if ("height" %in% names(.)) suppressWarnings(as.numeric(height)) else NA_real_,
+    Root_g = if ("root" %in% names(.)) suppressWarnings(as.numeric(root)) else NA_real_,
+    Stem_g = if ("stem" %in% names(.)) suppressWarnings(as.numeric(stem)) else NA_real_,
+    Leaf_g = if ("leaf" %in% names(.)) suppressWarnings(as.numeric(leaf)) else NA_real_,
+    DSI    = if ("dsi" %in% names(.)) suppressWarnings(as.numeric(dsi)) else NA_real_
+  ) %>%
+  mutate(
+    total_dry_g = Root_g + Stem_g + Leaf_g,
+    DateBatch = if_else(is.na(spore_date), NA_character_, format(spore_date, "%Y-%m-%d")),
+    TreatmentDate = if_else(treatment == "Control", "Control", paste(treatment, DateBatch, sep = "_")),
+    TreatmentDate = stats::relevel(factor(TreatmentDate), ref = "Control")
+  )
+
+write.csv(hdw, file.path(out_dir, "cleaned_height_dw.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# 4) Merge plant-level production and harvest-end measurements
+# ------------------------------------------------------------
+plant <- prod_plant %>%
+  full_join(
+    hdw %>%
+      select(sample_number, TreatmentDate, Height_any, Root_g, Stem_g, Leaf_g, total_dry_g, DSI),
+    by = c("sample_number", "TreatmentDate")
+  )
+
+write.csv(plant, file.path(out_dir, "per_plant_merged.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# 5) Trait-wise Dunnett contrasts versus the non-inoculated control
+# ------------------------------------------------------------
+run_dunnett <- function(df, response) {
+  df2 <- df %>% filter(!is.na(.data[[response]]), !is.na(TreatmentDate))
+  if (nrow(df2) < 3 || length(unique(df2$TreatmentDate)) < 2) return(NULL)
+
+  fit <- stats::lm(stats::as.formula(paste0(response, " ~ TreatmentDate")), data = df2)
+  emm <- emmeans::emmeans(fit, ~ TreatmentDate)
+
+  emmeans::contrast(emm, method = "trt.vs.ctrl", ref = "Control") %>%
+    summary(infer = TRUE) %>%
+    as.data.frame() %>%
+    mutate(Trait = response) %>%
+    relocate(Trait)
+}
+
+traits_for_dunnett <- c("total_yield_g", "mean_bunch_g", "max_height_cm", "total_dry_g", "DSI")
+
+dun_tbl <- bind_rows(lapply(traits_for_dunnett, function(tr) run_dunnett(plant, tr))) %>%
+  arrange(Trait, contrast)
+
+write.csv(dun_tbl, file.path(out_dir, "dunnett_vs_control_traits.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# 6) Build severity and danger scores
+# ------------------------------------------------------------
+# Control medians are used as the performance reference for scaling.
+ctrl <- plant %>%
+  filter(TreatmentDate == "Control") %>%
+  summarise(
+    ctrl_med_yield = median(total_yield_g, na.rm = TRUE),
+    ctrl_med_dry   = median(total_dry_g,   na.rm = TRUE),
+    ctrl_med_h_cm  = median(max_height_cm, na.rm = TRUE),
+    ctrl_med_h_any = median(Height_any,    na.rm = TRUE),
+    ctrl_med_dsi   = median(DSI,           na.rm = TRUE)
+  )
+
+ctrl_med_yield <- ctrl$ctrl_med_yield
+ctrl_med_dry   <- ctrl$ctrl_med_dry
+use_height_col <- ifelse(is.finite(ctrl$ctrl_med_h_cm) && !is.na(ctrl$ctrl_med_h_cm), "max_height_cm", "Height_any")
+ctrl_med_height <- if (use_height_col == "max_height_cm") ctrl$ctrl_med_h_cm else ctrl$ctrl_med_h_any
+
+# Threshold settings used in the chapter.
+dsi_scale  <- 4
+crash_frac <- 0.50
+
+plant_scored <- plant %>%
+  mutate(
+    height_used = .data[[use_height_col]],
+    yield_ratio  = total_yield_g / ctrl_med_yield,
+    dry_ratio    = total_dry_g   / ctrl_med_dry,
+    height_ratio = height_used   / ctrl_med_height,
+    yield_ratio  = pmin(pmax(yield_ratio,  0), 3),
+    dry_ratio    = pmin(pmax(dry_ratio,    0), 3),
+    height_ratio = pmin(pmax(height_ratio, 0), 3),
+    dsi_scaled   = pmin(pmax(DSI / dsi_scale, 0), 1),
+    sev_components_n = rowSums(!is.na(cbind(yield_ratio, dry_ratio, height_ratio, dsi_scaled))),
+    severity_score = (
+      if_else(!is.na(yield_ratio),  (1 - yield_ratio),  0) +
+      if_else(!is.na(dry_ratio),    (1 - dry_ratio),    0) +
+      if_else(!is.na(height_ratio), (1 - height_ratio), 0) +
+      if_else(!is.na(dsi_scaled),    dsi_scaled,        0)
+    ) / pmax(sev_components_n, 1),
+    severity_score = pmin(pmax(severity_score, -1), 2),
+    crash_yield  = !is.na(yield_ratio)  & yield_ratio  < crash_frac,
+    crash_dry    = !is.na(dry_ratio)    & dry_ratio    < crash_frac,
+    crash_height = !is.na(height_ratio) & height_ratio < crash_frac,
+    crash_dsi    = (as.character(TreatmentDate) != "Control") & !is.na(DSI) & DSI >= 1,
+    crash_any    = crash_yield | crash_dry | crash_height | crash_dsi
+  )
+
+# Treatment-level summary used for the severity–danger matrix.
+matrix_tbl <- plant_scored %>%
+  group_by(TreatmentDate) %>%
+  summarise(
+    n_plants = n(),
+    median_severity = median(severity_score, na.rm = TRUE),
+    worstQ_severity = quantile(severity_score, 0.75, na.rm = TRUE),
+    crash_rate_any  = mean(crash_any, na.rm = TRUE),
+    mad_severity    = mad(severity_score, na.rm = TRUE),
+    iqr_severity    = IQR(severity_score, na.rm = TRUE),
+    med_yield_g     = median(total_yield_g, na.rm = TRUE),
+    med_dry_g       = median(total_dry_g,   na.rm = TRUE),
+    med_height      = median(height_used,   na.rm = TRUE),
+    med_dsi         = median(DSI,           na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(matrix_tbl, file.path(out_dir, "danger_matrix_table.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# 7) Assign categorical danger/severity bands
+# ------------------------------------------------------------
+sev_breaks  <- c(-Inf, 0.15, 0.35, Inf)
+sev_labels  <- c("Low", "Moderate", "High")
+risk_breaks <- c(-Inf, 0.10, 0.30, Inf)
+risk_labels <- c("Low", "Moderate", "High")
+
+matrix_tbl2 <- matrix_tbl %>%
+  mutate(
+    Severity_band = cut(worstQ_severity, breaks = sev_breaks, labels = sev_labels, right = FALSE),
+    Danger_band   = cut(crash_rate_any,  breaks = risk_breaks, labels = risk_labels, right = FALSE)
+  )
+
+write.csv(matrix_tbl2, file.path(out_dir, "danger_matrix_table_with_bands.csv"), row.names = FALSE)
+
+# ------------------------------------------------------------
+# 8) Create a modelling-safe de-identified table
+# ------------------------------------------------------------
+# This version keeps isolate labels but avoids plot-jitter columns and other
+# downstream figure-specific fields.
+batch_key <- hdw %>%
+  filter(as.character(TreatmentDate) != "Control") %>%
+  mutate(
+    isolate_id = unname(id_map[treatment]),
+    batch_date = format(spore_date, "%Y-%m-%d")
+  ) %>%
+  distinct(isolate_id, batch_date) %>%
+  arrange(isolate_id, batch_date) %>%
+  group_by(isolate_id) %>%
+  mutate(batch_lab = paste0("B", row_number())) %>%
+  ungroup()
+
+danger_model_tbl <- matrix_tbl2 %>%
+  mutate(TreatmentDate = as.character(TreatmentDate)) %>%
+  transmute(
+    TreatmentDate,
+    isolate_raw = if_else(TreatmentDate == "Control", "Control", stringr::str_replace(TreatmentDate, "_\\d{4}-\\d{2}-\\d{2}$", "")),
+    batch_date  = if_else(TreatmentDate == "Control", NA_character_, stringr::str_extract(TreatmentDate, "\\d{4}-\\d{2}-\\d{2}$")),
+    isolate_id = case_when(
+      isolate_raw == "Control" ~ "Control",
+      isolate_raw %in% names(id_map) ~ unname(id_map[isolate_raw]),
+      TRUE ~ isolate_raw
+    )
+  ) %>%
+  left_join(batch_key %>% mutate(batch_date = as.character(batch_date)), by = c("isolate_id", "batch_date")) %>%
+  mutate(label = case_when(
+    isolate_id == "Control" ~ "Control",
+    TRUE ~ paste0(isolate_id, " (", batch_lab, ")")
+  )) %>%
+  left_join(matrix_tbl2 %>% mutate(TreatmentDate = as.character(TreatmentDate)), by = "TreatmentDate") %>%
+  select(label, TreatmentDate, crash_rate_any, worstQ_severity, median_severity, mad_severity, iqr_severity, Danger_band, Severity_band)
+
+write.csv(danger_model_tbl, file.path(out_dir, "danger_matrix_table_for_modelling.csv"), row.names = FALSE)
